@@ -220,15 +220,12 @@ pub fn cleanTestCache(cache: std.fs.Dir, test_name: []const u8) void {
 
 /// Looks up symbol name from instruction address
 pub fn cacheName(allocator: std.mem.Allocator, return_address: usize) ![]const u8 {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
     const debug_info = try std.debug.getSelfDebugInfo();
     const module = try debug_info.getModuleForAddress(return_address);
 
     // TODO: This seems like an entirely unsupported use case by std.debug.
     //       I think `module.getSymbolAtAddress` might need the debug allocator, but that is not exposed by std.debug
-    const symbol = try module.getSymbolAtAddress(arena.allocator(), return_address);
+    const symbol = try module.getSymbolAtAddress(std.heap.page_allocator, return_address);
 
     const name = try allocator.dupe(u8, symbol.name);
 
