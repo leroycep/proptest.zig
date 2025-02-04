@@ -7,7 +7,7 @@ const Integers = proptest.String(i32, .{
     },
 });
 
-test "slice of integers is in ascending order after sorting" {
+test "integers in ascending order after pdq sort" {
     try proptest.run(testIntegersAscending, Integers.strategy(), .{});
 }
 
@@ -15,7 +15,7 @@ fn testIntegersAscending(integers: []const i32) !void {
     var sorted = try std.testing.allocator.dupe(i32, integers);
     defer std.testing.allocator.free(sorted);
 
-    std.sort.insertion(i32, sorted, {}, std.sort.asc(i32));
+    std.sort.pdq(i32, sorted, {}, std.sort.asc(i32));
 
     if (sorted.len == 0) return;
 

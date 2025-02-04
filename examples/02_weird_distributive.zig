@@ -1,21 +1,19 @@
 const std = @import("std");
 const proptest = @import("proptest");
 
-const Integers = proptest.String(i32, .{
-    .min_len = 3,
-    .max_len = 3,
-    .ranges = &.{
-        .{ .min_max = .{ 0, 8192 } },
-        .{ .min_max = .{ -8192, 0 } },
-    },
+const Integer = proptest.Character(i32, &.{
+    .{ .min_max = .{ 0, 8192 } },
+    .{ .min_max = .{ -8192, 0 } },
 });
+const WeirdDistributiveFnInput = proptest.Tuple(&.{ i32, i32, i32 }, .{ Integer.strategy(), Integer.strategy(), Integer.strategy() });
 
 test "weird distributive" {
-    try proptest.run(testWeirdDistributive, Integers.strategy(), .{});
+    try proptest.run(testWeirdDistributive, WeirdDistributiveFnInput.strategy(), .{});
 }
 
-fn testWeirdDistributive(integers: []const i32) !void {
-    const a = (integers[0] + integers[1]) * integers[2];
-    const b = integers[0] * (integers[1] + integers[2]);
-    try std.testing.expectEqual(a, b);
+fn testWeirdDistributive(x: i32, y: i32, z: i32) !void {
+    try std.testing.expectEqual(
+        (x + y) * z,
+        x * (y + z),
+    );
 }

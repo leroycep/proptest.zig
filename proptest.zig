@@ -26,6 +26,7 @@ pub fn Strategy(comptime Input: type) type {
     return struct {
         create: fn (*Runner) anyerror!Input,
         shrink: fn (Input, *Runner, Runner.TacticIndex) anyerror!Input,
+        dupe: fn (Input, *Runner) anyerror!Input,
         destroy: fn (Input, *Runner) void,
         print: fn (Input) void,
     };
@@ -306,6 +307,7 @@ pub fn String(comptime T: type, comptime options: struct {
         pub fn strategy() Strategy(struct { []const T }) {
             return .{
                 .create = create,
+                .dupe = dupe,
                 .destroy = destroy,
                 .shrink = shrink,
                 .print = print,
@@ -319,6 +321,10 @@ pub fn String(comptime T: type, comptime options: struct {
                 element.* = try StringCharacter.create(runner);
             }
             return .{buf};
+        }
+
+        pub fn dupe(input: struct { []const T }, runner: *Runner) !struct { []const T } {
+            return .{try runner.allocator.dupe(T, input[0])};
         }
 
         pub fn destroy(input: struct { []const T }, runner: *Runner) void {
@@ -441,6 +447,109 @@ pub fn String(comptime T: type, comptime options: struct {
     };
 }
 
+pub fn Tuple(comptime input_types: []const type, comptime strategies: anytype) type {
+    const Input = std.meta.Tuple(input_types);
+    std.debug.assert(input_types.len == strategies.len);
+
+    return struct {
+        pub fn strategy() Strategy(Input) {
+            return .{
+                .create = create,
+                .dupe = dupe,
+                .destroy = destroy,
+                .shrink = shrink,
+                .print = print,
+            };
+        }
+
+        pub fn create(runner: *Runner) !Input {
+            var input: Input = undefined;
+
+            // TODO: handle cleaning up earlier inputs when a later input fails
+            inline for (&input, strategies) |*field, sub_strategy| {
+                field.* = try sub_strategy.create(runner);
+            }
+
+            return input;
+        }
+
+        pub fn dupe(input: Input, runner: *Runner) !Input {
+            var duplicate: Input = undefined;
+
+            // TODO: handle cleaning up earlier inputs when a later input fails
+            inline for (&duplicate, input, strategies) |*field, input_field, sub_strategy| {
+                field.* = try sub_strategy.dupe(input_field, runner);
+            }
+
+            return duplicate;
+        }
+
+        pub fn destroy(input: Input, runner: *Runner) void {
+            inline for (input, strategies) |field, sub_strategy| {
+                sub_strategy.destroy(field, runner);
+            }
+        }
+
+        const Tactic = enum(u32) {
+            all,
+            param0,
+            /// values beyond `param0` indicate `paramN`, where `N = value - @intFromEnum(.param0)`
+            _,
+        };
+
+        pub fn shrink(input: Input, runner: *Runner, tactic_index: Runner.TacticIndex) anyerror!Input {
+            const tactic: Tactic = @enumFromInt(runner.tactic(tactic_index));
+            switch (tactic) {
+                .all => {
+                    var shrunk: Input = undefined;
+
+                    const sub_tactic = try runner.tacticAfter(tactic_index);
+
+                    // TODO: handle cleaning up earlier shrinks when a later shrink fails
+                    inline for (&shrunk, input, strategies) |*shrunk_field, field, sub_strategy| {
+                        shrunk_field.* = sub_strategy.shrink(field, runner, sub_tactic) catch |err| switch (err) {
+                            error.ShrinkDeadEnd,
+                            error.ShrinkNoMoreTactics,
+                            => return error.ShrinkDeadEnd,
+                            else => return err,
+                        };
+                    }
+
+                    return shrunk;
+                },
+                else => {
+                    const param_index: u32 = @intFromEnum(tactic) - @intFromEnum(Tactic.param0);
+                    if (param_index >= strategies.len) return error.ShrinkNoMoreTactics;
+
+                    const sub_tactic = try runner.tacticAfter(tactic_index);
+
+                    var shrunk: Input = undefined;
+                    inline for (&shrunk, input, strategies, 0..) |*shrunk_field, field, sub_strategy, i| {
+                        if (i == param_index) {
+                            shrunk_field.* = try sub_strategy.dupe(field, runner);
+                        } else {
+                            shrunk_field.* = sub_strategy.shrink(field, runner, sub_tactic) catch |err| switch (err) {
+                                error.ShrinkDeadEnd,
+                                error.ShrinkNoMoreTactics,
+                                => return error.ShrinkDeadEnd,
+                                else => return err,
+                            };
+                        }
+                    }
+
+                    return shrunk;
+                },
+            }
+        }
+
+        pub fn print(input: Input) void {
+            inline for (input, strategies) |field, sub_strategy| {
+                sub_strategy.print(field);
+            }
+        }
+    };
+}
+
 pub fn Range(comptime T: type) type {
     return union(enum) {
         list: []const T,
@@ -490,6 +599,16 @@ pub fn Character(comptime T: type, comptime ranges: []const Range(T)) type {
     }
     const total_number_of_characters = total;
     return struct {
+        pub fn strategy() Strategy(T) {
+            return .{
+                .create = create,
+                .dupe = dupe,
+                .destroy = destroy,
+                .shrink = shrink,
+                .print = print,
+            };
+        }
+
         fn create(runner: *Runner) !T {
             if (runner.rand.int(u4) == 0) {
                 if (runner.rand.boolean()) {
@@ -529,7 +648,12 @@ pub fn Character(comptime T: type, comptime ranges: []const Range(T)) type {
             return null;
         }
 
-        fn destroy(_: T, _: std.mem.Allocator) void {}
+        fn dupe(input: T, runner: *Runner) !T {
+            _ = runner;
+            return input;
+        }
+
+        fn destroy(_: T, _: *Runner) void {}
 
         const Tactic = enum(u32) {
             change_to_first,
@@ -565,7 +689,7 @@ pub fn Character(comptime T: type, comptime ranges: []const Range(T)) type {
         }
 
         fn print(value: T) void {
-            std.debug.print("\'{'}\' ({}, 0x{x})\n", .{ std.zig.fmtEscapes(value), value, value });
+            std.debug.print("{d}  0x{x}\n", .{ value, value });
         }
     };
 }
