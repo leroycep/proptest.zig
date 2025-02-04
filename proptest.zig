@@ -76,7 +76,6 @@ pub fn run(src: std.builtin.SourceLocation, run_options: RunOptions, comptime In
 
         const input = try strategy.create(&runner);
 
-        std.debug.print("\r{s} iter {}/{}", .{ src.fn_name, iterations, run_options.max_iterations });
         testFn(input) catch |initial_error| switch (initial_error) {
             error.PropTestDiscard => continue,
             else => {
@@ -97,7 +96,6 @@ pub fn run(src: std.builtin.SourceLocation, run_options: RunOptions, comptime In
                     };
 
                     testFn(new_input) catch |e| if (e == initial_error) {
-                        std.debug.print("{s}:{} same as initial error: {}\n", .{ @src().file, @src().line, e });
                         // We got the same error back out! Continue simplifying with the new input, resetting the tactics we're using
                         runner.tactics.shrinkRetainingCapacity(0);
                         runner.tactics.appendAssumeCapacity(0);
@@ -108,9 +106,7 @@ pub fn run(src: std.builtin.SourceLocation, run_options: RunOptions, comptime In
                         continue;
                     } else {
                         // We got a different error: treat it the same as succeeding (error didn't reproduce)
-                        //std.debug.print("{s}:{} different error: {}\n", .{ @src().file, @src().line, e });
                     };
-                    //std.debug.print("{s}:{} trying different tactic: \n", .{ @src().file, @src().line });
 
                     // The test didn't fail, so our simplification didn't work.
                     // Change tactics and continue.
