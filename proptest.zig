@@ -9,67 +9,21 @@ const ControlErrors = error{
 
 pub const RunOptions = struct {
     allocator: std.mem.Allocator = std.testing.allocator,
-    cache_path: []const u8 = "zig-cache/test-cases",
+    cache_path: []const u8 = ".zig-cache/test-cases",
     max_iterations: usize = if (builtin.mode == .Debug) 1 else 100,
     print_value: bool = true,
     seed: ?usize = null,
 };
 
-pub fn ShrinkResult(comptime Input: type) type {
-    return union(enum) {
-        ok: Input,
-        dead_end,
-        no_more_tactics,
-        err: anyerror,
-
-        pub fn okOrNull(this: @This()) ?Input {
-            switch (this) {
-                .shrunk => |value| return value,
-                else => return null,
-            }
-        }
-
-        pub fn map_err(this: @This(), comptime OtherInput: type) ?ShrinkResult(OtherInput) {
-            switch (this) {
-                .shrunk => return null,
-                .dead_end => ShrinkResult(OtherInput).dead_end,
-                .no_more_tactics => ShrinkResult(OtherInput).no_more_tactics,
-                .err => ShrinkResult(OtherInput).err,
-            }
-        }
-
-        /// From the builtin zig error union
-        pub fn from(val: anytype) @This() {
-            if (@TypeOf(val) == @This()) return val;
-            if (@TypeOf(val) == Input) return .{ .ok = val };
-            switch (@typeInfo(@TypeOf(val))) {
-                .error_set => return .{ .err = val },
-
-                .error_union => if (val) |payload| {
-                    return .{ .ok = payload };
-                } else |err| {
-                    return .{ .err = err };
-                },
-
-                else => @compileError("Unsupported type " ++ @typeName(@TypeOf(val)) ++ " in " ++ @typeName(@This())),
-            }
-        }
-    };
-}
-
-/// From the builtin zig error union
-pub fn shrinkResultFrom(error_union: anytype) ShrinkResult(@typeInfo(@TypeOf(error_union)).ErrorUnion.payload) {
-    if (error_union) |payload| {
-        return ShrinkResult(@typeInfo(@TypeOf(error_union)).ErrorUnion.payload){ .ok = payload };
-    } else |err| {
-        return ShrinkResult(@typeInfo(@TypeOf(error_union)).ErrorUnion.payload){ .err = err };
-    }
-}
+const ShrinkControlErrors = error{
+    ShrinkNoMoreTactics,
+    ShrinkDeadEnd,
+};
 
 pub fn Strategy(comptime Input: type) type {
     return struct {
         create: fn (*Runner) anyerror!Input,
-        shrink: fn (Input, *Runner, tactic: usize) ShrinkResult(Input),
+        shrink: fn (Input, *Runner, Runner.TacticIndex) anyerror!Input,
         destroy: fn (Input, *Runner) void,
         print: fn (Input) void,
     };
@@ -80,15 +34,22 @@ pub const Runner = struct {
     rand: std.Random,
     tactics: std.ArrayListUnmanaged(u32),
 
-    pub fn tacticAfter(this: *@This(), idx: usize) !usize {
-        const after = idx + 1;
+    pub const TacticIndex = enum(u32) { root, _ };
+
+    pub fn tactic(this: *const @This(), tactic_index: TacticIndex) u32 {
+        return this.tactics.items[@intFromEnum(tactic_index)];
+    }
+
+    pub fn tacticAfter(this: *@This(), idx: TacticIndex) !TacticIndex {
+        const after = @intFromEnum(idx) + 1;
         if (after >= this.tactics.items.len) {
             try this.tactics.append(this.allocator, 0);
         }
-        return after;
+        return @enumFromInt(after);
     }
 
-    pub fn nextTactic(this: *@This(), idx: usize) void {
+    pub fn nextTactic(this: *@This(), tactic_index: TacticIndex) void {
+        const idx: u32 = @intFromEnum(tactic_index);
         this.tactics.shrinkRetainingCapacity(idx + 1);
         this.tactics.items[idx] += 1;
     }
@@ -126,23 +87,17 @@ pub fn run(src: std.builtin.SourceLocation, run_options: RunOptions, comptime In
                 var current_error = initial_error;
 
                 shrinking: while (true) {
-                    //std.debug.print("{s}:{} shrinking tactics: {any}\n", .{ @src().file, @src().line, runner.tactics.items });
-                    const new_input = switch (strategy.shrink(current_input, &runner, 0)) {
-                        .ok => |new| blk: {
-                            //std.debug.print("{s}:{} ok {any}\n", .{ @src().file, @src().line, new });
-                            break :blk new;
+                    const new_input = strategy.shrink(current_input, &runner, .root) catch |err| switch (err) {
+                        error.ShrinkDeadEnd => {
+                            runner.nextTactic(.root);
+                            continue :shrinking;
                         },
-                        .dead_end => {
-                            //std.debug.print("{s}:{} dead end\n", .{ @src().file, @src().line });
-                            runner.nextTactic(0);
-                            continue;
-                        },
-                        .no_more_tactics => break :shrinking,
-                        .err => |e| return e,
+                        error.ShrinkNoMoreTactics => break :shrinking,
+                        else => |e| return e,
                     };
 
                     testFn(new_input) catch |e| if (e == initial_error) {
-                        //std.debug.print("{s}:{} same as initial error: {}\n", .{ @src().file, @src().line, e });
+                        std.debug.print("{s}:{} same as initial error: {}\n", .{ @src().file, @src().line, e });
                         // We got the same error back out! Continue simplifying with the new input, resetting the tactics we're using
                         runner.tactics.shrinkRetainingCapacity(0);
                         runner.tactics.appendAssumeCapacity(0);
@@ -337,29 +292,27 @@ pub fn String(comptime T: type, comptime options: struct {
             _,
         };
 
-        pub fn shrink(buf: []const T, runner: *Runner, tacticIdx: usize) ShrinkResult([]const T) {
-            const Res = ShrinkResult([]const T);
-
-            if (buf.len <= options.min_len) return .no_more_tactics;
-            const tactic: Tactic = @enumFromInt(runner.tactics.items[tacticIdx]);
+        pub fn shrink(buf: []const T, runner: *Runner, tactic_index: Runner.TacticIndex) anyerror![]const T {
+            if (buf.len < options.min_len) return error.ShrinkNoMoreTactics;
+            const tactic: Tactic = @enumFromInt(runner.tactic(tactic_index));
             switch (tactic) {
                 .take_front_half,
                 .take_back_half,
                 => {
-                    if (buf.len / 2 < options.min_len) return .dead_end;
+                    if (buf.len / 2 < options.min_len) return error.ShrinkDeadEnd;
                     const buf_to_copy = switch (tactic) {
                         .take_front_half => buf[0 .. buf.len / 2],
                         .take_back_half => buf[buf.len / 2 ..],
                         else => unreachable,
                     };
-                    if (buf_to_copy.len == buf.len) return .dead_end;
-                    return Res.from(runner.allocator.dupe(T, buf_to_copy));
+                    if (buf_to_copy.len == buf.len) return error.ShrinkDeadEnd;
+                    return try runner.allocator.dupe(T, buf_to_copy);
                 },
                 .simplify,
                 .simplify_front_half,
                 .simplify_back_half,
                 => {
-                    const new = runner.allocator.dupe(T, buf) catch |e| return Res.from(e);
+                    const new = try runner.allocator.dupe(T, buf);
                     var should_free = true;
                     defer if (should_free) runner.allocator.free(new);
 
@@ -369,18 +322,17 @@ pub fn String(comptime T: type, comptime options: struct {
                         .simplify_back_half => new[0 .. buf.len / 2],
                         else => unreachable,
                     };
-                    if (to_simplify.len == 0) return .dead_end;
+                    if (to_simplify.len == 0) return error.ShrinkDeadEnd;
 
-                    const char_tactic = runner.tacticAfter(tacticIdx) catch |e| return Res.from(e);
+                    const char_tactic = try runner.tacticAfter(tactic_index);
 
                     while (true) {
                         var any_shrunk = false;
                         for (to_simplify) |*element| {
-                            element.* = switch (StringCharacter.shrink(element.*, runner, char_tactic)) {
-                                .ok => |s| s,
-                                .dead_end => continue,
-                                .no_more_tactics => return .dead_end,
-                                .err => |e| return .{ .err = e },
+                            element.* = StringCharacter.shrink(element.*, runner, char_tactic) catch |err| switch (err) {
+                                error.ShrinkDeadEnd => continue,
+                                error.ShrinkNoMoreTactics => return error.ShrinkDeadEnd,
+                                else => return err,
                             };
                             any_shrunk = true;
                         }
@@ -393,10 +345,16 @@ pub fn String(comptime T: type, comptime options: struct {
                     }
 
                     should_free = false;
-                    return .{ .ok = new };
+                    return new;
                 },
-                .remove_last_char => return Res.from(runner.allocator.dupe(T, buf[0 .. buf.len - 1])),
-                .remove_first_char => return Res.from(runner.allocator.dupe(T, buf[1..])),
+                .remove_last_char => {
+                    if (buf.len - 1 < options.min_len) return error.ShrinkDeadEnd;
+                    return try runner.allocator.dupe(T, buf[0 .. buf.len - 1]);
+                },
+                .remove_first_char => {
+                    if (buf.len - 1 < options.min_len) return error.ShrinkDeadEnd;
+                    return try runner.allocator.dupe(T, buf[1..]);
+                },
 
                 .simplify_last_char,
                 .simplify_first_char,
@@ -406,26 +364,25 @@ pub fn String(comptime T: type, comptime options: struct {
                         .simplify_first_char => 0,
                         else => unreachable,
                     };
-                    const char_tactic = runner.tacticAfter(tacticIdx) catch |e| return Res.from(e);
+                    const char_tactic = try runner.tacticAfter(tactic_index);
                     const new_char = while (true) {
-                        switch (StringCharacter.shrink(buf[to_simplify], runner, char_tactic)) {
-                            .ok => |val| break val,
-                            .dead_end => {
+                        break StringCharacter.shrink(buf[to_simplify], runner, char_tactic) catch |err| switch (err) {
+                            error.ShrinkDeadEnd => {
                                 runner.nextTactic(char_tactic);
                                 continue;
                             },
-                            .no_more_tactics => return .dead_end,
-                            .err => |e| return .{ .err = e },
-                        }
+                            error.ShrinkNoMoreTactics => return error.ShrinkDeadEnd,
+                            else => |e| return e,
+                        };
                     } else unreachable;
 
-                    const new = runner.allocator.dupe(T, buf) catch |e| return Res.from(e);
+                    const new = try runner.allocator.dupe(T, buf);
                     new[to_simplify] = new_char;
 
-                    return .{ .ok = new };
+                    return new;
                 },
 
-                _ => return .no_more_tactics,
+                _ => return error.ShrinkNoMoreTactics,
             }
         }
 
@@ -447,15 +404,15 @@ pub fn Range(comptime T: type) type {
             }
         }
 
-        pub fn size(this: @This()) usize {
+        pub fn size(this: @This()) std.meta.Int(.unsigned, @typeInfo(T).int.bits) {
             switch (this) {
-                .list => |l| return l.len,
+                .list => |l| return @intCast(l.len),
                 .min_max => |r| {
                     std.debug.assert(r[0] < r[1]);
-                    if (r[0] == std.math.minInt(T) and r[1] == std.math.maxInt(T)) {
-                        return 2 << @typeInfo(T).int.bits - 1;
-                    }
-                    return @as(usize, @intCast(r[1] - r[0])) + 1;
+                    const WideInt = std.meta.Int(@typeInfo(T).int.signedness, @typeInfo(T).int.bits + 1);
+                    const left: WideInt = r[0];
+                    const right: WideInt = r[1];
+                    return @intCast(right - left);
                 },
             }
         }
@@ -532,29 +489,29 @@ pub fn Character(comptime T: type, comptime ranges: []const Range(T)) type {
             _,
         };
 
-        fn shrink(current: T, runner: *Runner, tacticIdx: usize) ShrinkResult(T) {
-            const tactic: Tactic = @enumFromInt(runner.tactics.items[tacticIdx]);
+        fn shrink(current: T, runner: *Runner, tactic_index: Runner.TacticIndex) anyerror!T {
+            const tactic: Tactic = @enumFromInt(runner.tactic(tactic_index));
             switch (tactic) {
                 .change_to_first => {
                     const first = ranges[0].valueAt(0);
-                    if (current == first) return .dead_end;
-                    return .{ .ok = first };
+                    if (current == first) return error.ShrinkDeadEnd;
+                    return first;
                 },
                 .set_to_half => {
                     const current_idx = characterToIndex(current) orelse {
                         std.debug.panic("Generated character not in ranges! (0x{x}, {})", .{ current, current });
                     };
-                    if (current_idx == 0) return .dead_end;
-                    return .{ .ok = indexToCharacter(current_idx / 2) };
+                    if (current_idx == 0) return error.ShrinkDeadEnd;
+                    return indexToCharacter(current_idx / 2);
                 },
                 .decrement => {
                     const current_idx = characterToIndex(current) orelse {
                         std.debug.panic("Generated character not in ranges! (0x{x}, {})", .{ current, current });
                     };
-                    if (current_idx == 0) return .dead_end;
-                    return .{ .ok = indexToCharacter(current_idx - 1) };
+                    if (current_idx == 0) return error.ShrinkDeadEnd;
+                    return indexToCharacter(current_idx - 1);
                 },
-                _ => return .no_more_tactics,
+                _ => return error.ShrinkNoMoreTactics,
             }
         }
 

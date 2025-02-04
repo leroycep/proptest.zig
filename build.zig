@@ -13,10 +13,12 @@ pub fn build(b: *std.Build) void {
     // Examples
     const sum = addExample(b, b.path("examples/00_sum.zig"), optimize, target, proptest);
     const hello = addExample(b, b.path("examples/01_hello.zig"), optimize, target, proptest);
+    const weird_distributive = addExample(b, b.path("examples/02_weird_distributive.zig"), optimize, target, proptest);
 
     const examples_step = b.step("test-examples", "Run example tests");
     examples_step.dependOn(&sum.step);
     examples_step.dependOn(&hello.step);
+    examples_step.dependOn(&weird_distributive.step);
 }
 
 fn addExample(b: *std.Build, source: std.Build.LazyPath, optimize: std.builtin.OptimizeMode, target: std.Build.ResolvedTarget, proptest: *std.Build.Module) *std.Build.Step.Run {

@@ -14,7 +14,7 @@ test "integer sum is commutative" {
 }
 
 fn testSumIsCommutative(integers: []const i32) !void {
-    const x = integers[0] + integers[1];
-    const y = integers[1] + integers[0];
+    const x = integers[0] +% integers[1];
+    const y = integers[1] +% integers[0];
     try std.testing.expectEqual(x, y);
 }
