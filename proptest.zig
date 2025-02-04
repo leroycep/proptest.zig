@@ -13,6 +13,8 @@ pub const RunOptions = struct {
     max_iterations: usize = if (builtin.mode == .Debug) 1 else 100,
     print_value: bool = true,
     seed: ?usize = null,
+    /// This address will be used to do symbol lookup. If that fails, it uses the hexadecimal as a name.
+    return_address: ?usize = null,
 };
 
 const ShrinkControlErrors = error{
@@ -59,24 +61,36 @@ pub const Runner = struct {
     }
 };
 
-pub fn run(src: std.builtin.SourceLocation, run_options: RunOptions, comptime Input: type, strategy: Strategy(Input), testFn: fn (Input) anyerror!void) !void {
-    var cache = try std.fs.cwd().makeOpenPath(run_options.cache_path, .{});
+/// Inline so that `runTyped`
+pub inline fn run(testFn: anytype, strategy: Strategy(FnParams(testFn)), options: RunOptions) !void {
+    var new_options = options;
+    if (new_options.return_address == null) new_options.return_address = @returnAddress();
+    return runTyped(FnParams(testFn), testFn, strategy, new_options);
+}
+
+pub fn runTyped(comptime Input: type, testFn: TestFnWithParams(Input), strategy: Strategy(Input), options: RunOptions) !void {
+    var cache = try std.fs.cwd().makeOpenPath(options.cache_path, .{});
     defer cache.close();
 
-    const test_name = &cacheName(src);
-    const seed = run_options.seed orelse try getInputU64(cache, test_name);
+    const return_address = options.return_address orelse @returnAddress();
+    const test_name = cacheName(std.testing.allocator, return_address) catch blk: {
+        break :blk try std.fmt.allocPrint(std.testing.allocator, "0x{x:0>" ++ std.fmt.comptimePrint("{d}", .{@sizeOf(usize) * 2}) ++ "}", .{return_address});
+    };
+    defer std.testing.allocator.free(test_name);
+
+    const seed = options.seed orelse try getInputU64(cache, test_name);
 
     // TODO: switch on return type
     var iterations: usize = 0;
-    while (iterations < run_options.max_iterations) : (iterations += 1) {
+    while (iterations < options.max_iterations) : (iterations += 1) {
         const iteration_seed = seed + iterations;
         var prng = std.Random.DefaultPrng.init(iteration_seed);
-        var runner = Runner{ .allocator = run_options.allocator, .rand = prng.random(), .tactics = .{} };
+        var runner = Runner{ .allocator = options.allocator, .rand = prng.random(), .tactics = .{} };
         defer runner.tactics.deinit(runner.allocator);
 
         const input = try strategy.create(&runner);
 
-        testFn(input) catch |initial_error| switch (initial_error) {
+        @call(.auto, testFn, input) catch |initial_error| switch (initial_error) {
             error.PropTestDiscard => continue,
             else => {
                 // Try to shrink test case
@@ -95,7 +109,7 @@ pub fn run(src: std.builtin.SourceLocation, run_options: RunOptions, comptime In
                         else => |e| return e,
                     };
 
-                    testFn(new_input) catch |e| if (e == initial_error) {
+                    @call(.auto, testFn, new_input) catch |e| if (e == initial_error) {
                         // We got the same error back out! Continue simplifying with the new input, resetting the tactics we're using
                         runner.tactics.shrinkRetainingCapacity(0);
                         runner.tactics.appendAssumeCapacity(0);
@@ -115,8 +129,8 @@ pub fn run(src: std.builtin.SourceLocation, run_options: RunOptions, comptime In
                 }
 
                 // Print input
-                std.debug.print("{s} failed with error: {}\n", .{ src.fn_name, current_error });
-                if (run_options.print_value) {
+                std.debug.print("{s} failed with error: {}\n", .{ test_name, current_error });
+                if (options.print_value) {
                     strategy.print(current_input);
                     std.debug.print("\n", .{});
                 }
@@ -131,9 +145,43 @@ pub fn run(src: std.builtin.SourceLocation, run_options: RunOptions, comptime In
         strategy.destroy(input, &runner);
     }
 
-    if (run_options.seed == null) {
+    if (options.seed == null) {
         cleanTestCache(cache, test_name);
     }
+}
+
+fn FnParams(function: anytype) type {
+    const function_info = @typeInfo(@TypeOf(function)).@"fn";
+    comptime var param_types: [function_info.params.len]type = undefined;
+    inline for (function_info.params, &param_types) |param_info, *param_type| {
+        if (param_info.is_generic) @compileError("Generic parameters not supported as property testing input");
+        if (param_info.is_noalias) @compileError("`noalias` parameters not supported as property testing input");
+        param_type.* = param_info.type.?;
+    }
+    return std.meta.Tuple(&param_types);
+}
+
+fn TestFnWithParams(Input: type) type {
+    const input_info = @typeInfo(Input).@"struct";
+
+    comptime var params: [input_info.fields.len]std.builtin.Type.Fn.Param = undefined;
+    inline for (input_info.fields, &params) |field_info, *param| {
+        param.* = .{
+            .is_generic = false,
+            .is_noalias = false,
+            .type = field_info.type,
+        };
+    }
+
+    const function_info = std.builtin.Type.Fn{
+        .calling_convention = .auto,
+        .is_generic = false,
+        .is_var_args = false,
+        .return_type = anyerror!void,
+        .params = &params,
+    };
+
+    return @Type(.{ .@"fn" = function_info });
 }
 
 /// Get an u64 and store it in the test cases cache. This allows us to redo the same test case if it fails.
@@ -170,14 +218,19 @@ pub fn cleanTestCache(cache: std.fs.Dir, test_name: []const u8) void {
     cache.deleteFile(test_name) catch return;
 }
 
-pub const CACHE_NAME_LEN = std.base64.url_safe_no_pad.Encoder.calcSize(16);
+/// Looks up symbol name from instruction address
+pub fn cacheName(allocator: std.mem.Allocator, return_address: usize) ![]const u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
 
-pub fn cacheName(src: std.builtin.SourceLocation) [CACHE_NAME_LEN]u8 {
-    var hash: [16]u8 = undefined;
-    std.crypto.hash.Blake3.hash(src.fn_name, &hash, .{});
+    const debug_info = try std.debug.getSelfDebugInfo();
+    const module = try debug_info.getModuleForAddress(return_address);
 
-    var name: [std.base64.url_safe_no_pad.Encoder.calcSize(16)]u8 = undefined;
-    _ = std.base64.url_safe_no_pad.Encoder.encode(&name, &hash);
+    // TODO: This seems like an entirely unsupported use case by std.debug.
+    //       I think `module.getSymbolAtAddress` might need the debug allocator, but that is not exposed by std.debug
+    const symbol = try module.getSymbolAtAddress(arena.allocator(), return_address);
+
+    const name = try allocator.dupe(u8, symbol.name);
 
     return name;
 }
@@ -253,7 +306,7 @@ pub fn String(comptime T: type, comptime options: struct {
     const StringCharacter = Character(T, options.ranges);
 
     return struct {
-        pub fn strategy() Strategy([]const T) {
+        pub fn strategy() Strategy(struct { []const T }) {
             return .{
                 .create = create,
                 .destroy = destroy,
@@ -262,16 +315,17 @@ pub fn String(comptime T: type, comptime options: struct {
             };
         }
 
-        pub fn create(runner: *Runner) ![]const T {
+        pub fn create(runner: *Runner) !struct { []const T } {
             const len = if (options.min_len == options.max_len) options.min_len else runner.rand.intRangeLessThan(usize, options.min_len, options.max_len);
             const buf = try runner.allocator.alloc(T, len);
             for (buf) |*element| {
                 element.* = try StringCharacter.create(runner);
             }
-            return buf;
+            return .{buf};
         }
 
-        pub fn destroy(buf: []const T, runner: *Runner) void {
+        pub fn destroy(input: struct { []const T }, runner: *Runner) void {
+            const buf = input[0];
             runner.allocator.free(buf);
         }
 
@@ -288,7 +342,8 @@ pub fn String(comptime T: type, comptime options: struct {
             _,
         };
 
-        pub fn shrink(buf: []const T, runner: *Runner, tactic_index: Runner.TacticIndex) anyerror![]const T {
+        pub fn shrink(input: struct { []const T }, runner: *Runner, tactic_index: Runner.TacticIndex) anyerror!struct { []const T } {
+            const buf = input[0];
             if (buf.len < options.min_len) return error.ShrinkNoMoreTactics;
             const tactic: Tactic = @enumFromInt(runner.tactic(tactic_index));
             switch (tactic) {
@@ -302,7 +357,7 @@ pub fn String(comptime T: type, comptime options: struct {
                         else => unreachable,
                     };
                     if (buf_to_copy.len == buf.len) return error.ShrinkDeadEnd;
-                    return try runner.allocator.dupe(T, buf_to_copy);
+                    return .{try runner.allocator.dupe(T, buf_to_copy)};
                 },
                 .simplify,
                 .simplify_front_half,
@@ -341,15 +396,15 @@ pub fn String(comptime T: type, comptime options: struct {
                     }
 
                     should_free = false;
-                    return new;
+                    return .{new};
                 },
                 .remove_last_char => {
                     if (buf.len - 1 < options.min_len) return error.ShrinkDeadEnd;
-                    return try runner.allocator.dupe(T, buf[0 .. buf.len - 1]);
+                    return .{try runner.allocator.dupe(T, buf[0 .. buf.len - 1])};
                 },
                 .remove_first_char => {
                     if (buf.len - 1 < options.min_len) return error.ShrinkDeadEnd;
-                    return try runner.allocator.dupe(T, buf[1..]);
+                    return .{try runner.allocator.dupe(T, buf[1..])};
                 },
 
                 .simplify_last_char,
@@ -375,14 +430,15 @@ pub fn String(comptime T: type, comptime options: struct {
                     const new = try runner.allocator.dupe(T, buf);
                     new[to_simplify] = new_char;
 
-                    return new;
+                    return .{new};
                 },
 
                 _ => return error.ShrinkNoMoreTactics,
             }
         }
 
-        pub fn print(string: []const T) void {
+        pub fn print(input: struct { []const T }) void {
+            const string = input[0];
             std.debug.print("{any}\n", .{string});
         }
     };

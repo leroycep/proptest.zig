@@ -8,7 +8,7 @@ const Integers = proptest.String(i32, .{
 });
 
 test "slice of integers is in ascending order after sorting" {
-    try proptest.run(@src(), .{}, []const i32, Integers.strategy(), testIntegersAscending);
+    try proptest.run(testIntegersAscending, Integers.strategy(), .{});
 }
 
 fn testIntegersAscending(integers: []const i32) !void {

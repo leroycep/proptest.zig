@@ -10,7 +10,7 @@ const Integers = proptest.String(i32, .{
 });
 
 test "integer sum is commutative" {
-    try proptest.run(@src(), .{}, []const i32, Integers.strategy(), testSumIsCommutative);
+    try proptest.run(testSumIsCommutative, Integers.strategy(), .{});
 }
 
 fn testSumIsCommutative(integers: []const i32) !void {

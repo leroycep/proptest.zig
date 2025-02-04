@@ -11,7 +11,7 @@ const Integers = proptest.String(i32, .{
 });
 
 test "weird distributive" {
-    try proptest.run(@src(), .{}, []const i32, Integers.strategy(), testWeirdDistributive);
+    try proptest.run(testWeirdDistributive, Integers.strategy(), .{});
 }
 
 fn testWeirdDistributive(integers: []const i32) !void {
