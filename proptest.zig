@@ -43,9 +43,9 @@ pub fn ShrinkResult(comptime Input: type) type {
             if (@TypeOf(val) == @This()) return val;
             if (@TypeOf(val) == Input) return .{ .ok = val };
             switch (@typeInfo(@TypeOf(val))) {
-                .ErrorSet => return .{ .err = val },
+                .error_set => return .{ .err = val },
 
-                .ErrorUnion => if (val) |payload| {
+                .error_union => if (val) |payload| {
                     return .{ .ok = payload };
                 } else |err| {
                     return .{ .err = err };
@@ -77,7 +77,7 @@ pub fn Strategy(comptime Input: type) type {
 
 pub const Runner = struct {
     allocator: std.mem.Allocator,
-    rand: std.rand.Random,
+    rand: std.Random,
     tactics: std.ArrayListUnmanaged(u32),
 
     pub fn tacticAfter(this: *@This(), idx: usize) !usize {
@@ -109,7 +109,7 @@ pub fn run(src: std.builtin.SourceLocation, run_options: RunOptions, comptime In
     var iterations: usize = 0;
     while (iterations < run_options.max_iterations) : (iterations += 1) {
         const iteration_seed = seed + iterations;
-        var prng = std.rand.DefaultPrng.init(iteration_seed);
+        var prng = std.Random.DefaultPrng.init(iteration_seed);
         var runner = Runner{ .allocator = run_options.allocator, .rand = prng.random(), .tactics = .{} };
         defer runner.tactics.deinit(runner.allocator);
 
@@ -196,7 +196,10 @@ pub fn getInputU64(cache: std.fs.Dir, test_name: []const u8) !u64 {
         // Generate a test case
         error.FileNotFound => {
             const new_test_case = std.crypto.random.int(u64);
-            try cache.writeFile(test_name, std.mem.asBytes(&new_test_case));
+            try cache.writeFile(.{
+                .sub_path = test_name,
+                .data = std.mem.asBytes(&new_test_case),
+            });
             return new_test_case;
         },
 
@@ -208,7 +211,7 @@ pub fn getInputU64(cache: std.fs.Dir, test_name: []const u8) !u64 {
         return error.UnexpectedValueInCache;
     }
 
-    return @bitCast(u64, test_case[0..@sizeOf(u64)].*);
+    return @bitCast(test_case[0..@sizeOf(u64)].*);
 }
 
 /// The test succeeded, we remove the cached input and do a different test case
@@ -338,12 +341,13 @@ pub fn String(comptime T: type, comptime options: struct {
             const Res = ShrinkResult([]const T);
 
             if (buf.len <= options.min_len) return .no_more_tactics;
-            switch (@intToEnum(Tactic, runner.tactics.items[tacticIdx])) {
+            const tactic: Tactic = @enumFromInt(runner.tactics.items[tacticIdx]);
+            switch (tactic) {
                 .take_front_half,
                 .take_back_half,
                 => {
                     if (buf.len / 2 < options.min_len) return .dead_end;
-                    const buf_to_copy = switch (@intToEnum(Tactic, runner.tactics.items[tacticIdx])) {
+                    const buf_to_copy = switch (tactic) {
                         .take_front_half => buf[0 .. buf.len / 2],
                         .take_back_half => buf[buf.len / 2 ..],
                         else => unreachable,
@@ -359,7 +363,7 @@ pub fn String(comptime T: type, comptime options: struct {
                     var should_free = true;
                     defer if (should_free) runner.allocator.free(new);
 
-                    const to_simplify = switch (@intToEnum(Tactic, runner.tactics.items[tacticIdx])) {
+                    const to_simplify = switch (tactic) {
                         .simplify => new,
                         .simplify_front_half => new[buf.len / 2 ..],
                         .simplify_back_half => new[0 .. buf.len / 2],
@@ -382,7 +386,7 @@ pub fn String(comptime T: type, comptime options: struct {
                         }
                         if (!any_shrunk) {
                             runner.nextTactic(char_tactic);
-                            std.mem.copy(T, new, buf);
+                            @memcpy(new, buf);
                             continue;
                         }
                         break;
@@ -397,7 +401,7 @@ pub fn String(comptime T: type, comptime options: struct {
                 .simplify_last_char,
                 .simplify_first_char,
                 => {
-                    const to_simplify = switch (@intToEnum(Tactic, runner.tactics.items[tacticIdx])) {
+                    const to_simplify = switch (tactic) {
                         .simplify_last_char => buf.len - 1,
                         .simplify_first_char => 0,
                         else => unreachable,
@@ -439,7 +443,7 @@ pub fn Range(comptime T: type) type {
         pub fn valueAt(this: @This(), index: usize) T {
             switch (this) {
                 .list => |l| return l[index],
-                .min_max => |r| return r[0] + @intCast(T, index),
+                .min_max => |r| return r[0] + @as(T, @intCast(index)),
             }
         }
 
@@ -449,9 +453,9 @@ pub fn Range(comptime T: type) type {
                 .min_max => |r| {
                     std.debug.assert(r[0] < r[1]);
                     if (r[0] == std.math.minInt(T) and r[1] == std.math.maxInt(T)) {
-                        return 2 << @typeInfo(T).Int.bits - 1;
+                        return 2 << @typeInfo(T).int.bits - 1;
                     }
-                    return @intCast(usize, r[1] - r[0]) + 1;
+                    return @as(usize, @intCast(r[1] - r[0])) + 1;
                 },
             }
         }
@@ -462,7 +466,7 @@ pub fn Range(comptime T: type) type {
                 .min_max => |r| {
                     std.debug.assert(r[0] < r[1]);
                     if (r[0] <= t and t < r[1]) {
-                        return @intCast(usize, t - r[0]);
+                        return @intCast(t - r[0]);
                     }
                     return null;
                 },
@@ -529,7 +533,8 @@ pub fn Character(comptime T: type, comptime ranges: []const Range(T)) type {
         };
 
         fn shrink(current: T, runner: *Runner, tacticIdx: usize) ShrinkResult(T) {
-            switch (@intToEnum(Tactic, runner.tactics.items[tacticIdx])) {
+            const tactic: Tactic = @enumFromInt(runner.tactics.items[tacticIdx]);
+            switch (tactic) {
                 .change_to_first => {
                     const first = ranges[0].valueAt(0);
                     if (current == first) return .dead_end;
